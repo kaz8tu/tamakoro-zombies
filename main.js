@@ -4,19 +4,23 @@ import tamakoroPng from './tamakoro.png';
 class MainScene extends Phaser.Scene {
   constructor() {
     super('main');
-    this.tilt = { x: 0, y: 0 };
+    this.tilt   = { x: 0, y: 0 };
     this.smooth = { x: 0, y: 0 };
-    this.alpha = 0.18;        // 反応
-    this.forceK = 0.0005;     // 力
-    this.maxSpeed = 8.0;      // 最高速
+    this.alpha  = 0.18;      // センサー応答
+    this.forceK = 0.0005;    // 力の係数
+    this.maxSpeed = 8.0;     // 最高速度
     this.startPos = { x: 0, y: 0 };
-    this.motionEnabledAt = 0; // 許可時刻（クールダウンに使用）
+    this.motionActive = false;     // 力を加えるかどうか
+    this.motionEnabledAt = 0;      // 許可時刻
+    this.innerRect = null;         // 迷路矩形（境界判定用）
   }
 
-  preload() { this.load.image('ball', tamakoroPng); }
+  preload() {
+    this.load.image('ball', tamakoroPng);
+  }
 
   create() {
-    // 迷路（外周は # で囲う）
+    // 迷路（S=Start, G=Goal, #=Wall）
     this.map = [
       '#################',
       '#S..#.....#....G#',
@@ -31,6 +35,7 @@ class MainScene extends Phaser.Scene {
       '#################',
     ];
 
+    // iOS センサー許可ボタン
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
       typeof DeviceMotionEvent.requestPermission === 'function';
@@ -47,8 +52,10 @@ class MainScene extends Phaser.Scene {
           if (DeviceOrientationEvent?.requestPermission) await DeviceOrientationEvent.requestPermission();
         }
         this.setupSensors();
-        this.resetPlayerToStart();
-        this.motionEnabledAt = performance.now();  // ← クールダウン開始
+        this.resetPlayerToStart();              // 許可直後に安全初期化
+        this.motionActive = false;
+        this.motionEnabledAt = performance.now();
+        setTimeout(() => { this.motionActive = true; }, 800); // 800msは力を加えない
         btn.remove();
       } catch (e) { console.error(e); alert('Motion permission failed.'); }
     };
@@ -97,14 +104,17 @@ class MainScene extends Phaser.Scene {
     const offsetY = Math.floor(viewH/2 - mapH/2);
     const toWorld = (cx,cy)=>({ x: offsetX + cx*tile + tile/2, y: offsetY + cy*tile + tile/2 });
 
-    // Matter 強化（トンネリング耐性）
+    // 迷路矩形を記録（境界外検知用）
+    this.innerRect = new Phaser.Geom.Rectangle(offsetX, offsetY, mapW, mapH);
+
+    // Matter 安定化
     this.matter.world.engine.positionIterations = 10;
     this.matter.world.engine.velocityIterations = 10;
     this.matter.world.engine.world.gravity.x = 0;
     this.matter.world.engine.world.gravity.y = 0;
 
-    // 画面の外周境界は OFF（迷路外に出る前に次の“外側壁”で止める）
-    this.matter.world.setBounds(0, 0, viewW, viewH, 0);
+    // ★ 迷路矩形＝世界境界（厚み＝タイル幅）
+    this.matter.world.setBounds(offsetX, offsetY, mapW, mapH, tile, true, true, true, true);
 
     // 背景
     this.add.rectangle(offsetX + mapW/2, offsetY + mapH/2, mapW, mapH, 0x111111);
@@ -120,19 +130,7 @@ class MainScene extends Phaser.Scene {
       }
     });});
 
-    // ★ 迷路の「さらに外側」に見えない厚い壁を配置（通路とは干渉しない）
-    const B = tile * 2; // 十分厚くして脱走防止
-    const outerLeft   = offsetX - B/2;
-    const outerRight  = offsetX + mapW + B/2;
-    const outerTop    = offsetY - B/2;
-    const outerBottom = offsetY + mapH + B/2;
-    const addBorder = (x,y,w,h)=>this.matter.add.rectangle(x,y,w,h,{isStatic:true,label:'outer',render:{visible:false}});
-    addBorder(offsetX + mapW/2, outerTop,    mapW + B*2, B); // 上
-    addBorder(offsetX + mapW/2, outerBottom, mapW + B*2, B); // 下
-    addBorder(outerLeft,  offsetY + mapH/2, B, mapH + B*2);  // 左
-    addBorder(outerRight, offsetY + mapH/2, B, mapH + B*2);  // 右
-
-    // スタート/ゴール
+    // スタート／ゴール
     let start=toWorld(1,1), goal=toWorld(cols-2,1);
     this.map.forEach((row,y)=>{ [...row].forEach((c,x)=>{
       if(c==='S') start=toWorld(x,y);
@@ -156,12 +154,13 @@ class MainScene extends Phaser.Scene {
     this.ball.setDisplaySize(r*2, r*2);
     Phaser.Physics.Matter.Matter.Body.setInertia(this.ball.body, Infinity);
 
-    // ゾンビ
+    // ★ ゾンビは内側の安全セルからスポーン（外縁から離す）
     const zR = Math.floor(tile*0.40);
-    this.zombie = this.matter.add.circle(goal.x, goal.y, zR, {
+    const zSpawn = toWorld(cols - 2, rows - 2); // 右下の一つ内側
+    this.zombie = this.matter.add.circle(zSpawn.x, zSpawn.y, zR, {
       restitution:0.03, frictionAir:0.06, label:'zombie'
     });
-    this.zombieSprite = this.add.circle(goal.x, goal.y, zR, 0xff4d4d);
+    this.zombieSprite = this.add.circle(zSpawn.x, zSpawn.y, zR, 0xff4d4d);
 
     // 衝突
     this.matter.world.on('collisionstart', (evt)=>{
@@ -173,9 +172,6 @@ class MainScene extends Phaser.Scene {
         if(hitZombie){ this.centerText('GAME OVER 💀','#f55','#300'); this.time.delayedCall(900,()=>this.scene.restart()); return; }
       }
     });
-
-    // 画面サイズ・位置を後で使うため保存
-    this._geom = { offsetX, offsetY, mapW, mapH };
   }
 
   resetPlayerToStart() {
@@ -192,11 +188,11 @@ class MainScene extends Phaser.Scene {
     this.add.text(w/2,h/2,msg,{fontFamily:'system-ui,-apple-system,sans-serif',fontSize:Math.floor(w*0.08)+'px',color,stroke,strokeThickness:2}).setOrigin(0.5);
   }
 
-  update(time) {
+  update() {
     if(!this.ball?.body) return;
 
-    // 許可直後は力を加えない（スパイク無効化）
-    if (this.motionEnabledAt && time - this.motionEnabledAt < 600) return;
+    // 許可前／クールダウン中は操作しない
+    if (!this.motionActive) return;
 
     // ローパス
     this.smooth.x += this.alpha * (this.tilt.x - this.smooth.x);
@@ -214,7 +210,15 @@ class MainScene extends Phaser.Scene {
     const v=this.ball.body.velocity, sp=Math.hypot(v.x,v.y);
     if(sp>this.maxSpeed) Body.setVelocity(this.ball.body,{x:v.x*(this.maxSpeed/sp), y:v.y*(this.maxSpeed/sp)});
 
-    // ゾンビ追従＆表示同期
+    // ★ 安全策：境界の外に出たら即スタートに戻す
+    if (this.innerRect && !Phaser.Geom.Rectangle.Contains(this.innerRect, this.ball.x, this.ball.y)) {
+      this.resetPlayerToStart();
+      this.motionActive = false;
+      setTimeout(()=>{ this.motionActive = true; }, 300); // 軽い猶予
+      return;
+    }
+
+    // ゾンビ追従 & 同期
     if(this.zombie && this.zombieSprite){
       const dx=this.ball.body.position.x - this.zombie.position.x;
       const dy=this.ball.body.position.y - this.zombie.position.y;
