@@ -4,7 +4,6 @@ import tamakoroPng from './tamakoro.png';
 class MainScene extends Phaser.Scene {
   constructor() {
     super('main');
-    // 画面要素の参照入れ物
     this.walls = null;
     this.ball = null;
     this.zombie = null;
@@ -33,7 +32,7 @@ class MainScene extends Phaser.Scene {
       '#################',
     ];
 
-    // ジャイロ（許可はボタンで）
+    // ジャイロ
     this.tilt = { x: 0, y: 0 };
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
@@ -67,10 +66,10 @@ class MainScene extends Phaser.Scene {
     // 物理の安定化
     this.physics.world.setFPS(180);
 
-    // 初期レイアウト：iOSのビューポートが落ち着くまで少し待つ
+    // 初期レイアウト（少し遅延）
     this.time.delayedCall(60, () => this.buildOrRebuild());
 
-    // リサイズ時はデバウンスして安全に再レイアウト（再起動しない）
+    // リサイズはデバウンスで再レイアウト（restartしない）
     const onResize = () => {
       clearTimeout(this._resizeTimer);
       this._resizeTimer = setTimeout(() => {
@@ -82,16 +81,14 @@ class MainScene extends Phaser.Scene {
     window.visualViewport?.addEventListener('resize', onResize, { passive: true });
   }
 
-  // 現在の実サイズを取得（iOSは visualViewport 優先）
   getViewSize() {
     const vw = Math.floor(window.visualViewport?.width  ?? window.innerWidth  ?? this.scale.width  ?? 1);
     const vh = Math.floor(window.visualViewport?.height ?? window.innerHeight ?? this.scale.height ?? 1);
     return { vw: Math.max(1, vw), vh: Math.max(1, vh) };
   }
 
-  // 既存要素を破棄して描き直す（scene.restart は使わない）
   buildOrRebuild() {
-    // 既存を安全に破棄
+    // 既存を破棄
     if (this.walls) { this.walls.clear(true, true); this.walls = null; }
     this.ball?.destroy();   this.ball   = null;
     this.zombie?.destroy(); this.zombie = null;
@@ -121,7 +118,7 @@ class MainScene extends Phaser.Scene {
       y: offsetY + cy * tileSize + tileSize / 2,
     });
 
-    // 壁配置
+    // 壁
     this.walls = this.physics.add.staticGroup();
 
     let startPos = { x: vw / 2, y: vh / 2 };
@@ -132,8 +129,8 @@ class MainScene extends Phaser.Scene {
         const { x: cx, y: cy } = toWorld(x, y);
         if (cell === '#') {
           const wall = this.add.rectangle(cx, cy, tileSize, tileSize, 0x555555);
-          this.physics.add.existing(wall, true);
-          wall.refreshBody(); // 見た目と物理の同期
+          this.physics.add.existing(wall, true);      // static body を付与
+          wall.body.updateFromGameObject();           // ← ★ここが修正点（refreshBodyではなくこれ）
           this.walls.add(wall);
         } else if (cell === 'S') {
           startPos = { x: cx, y: cy };
