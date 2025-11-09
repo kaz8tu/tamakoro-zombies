@@ -9,8 +9,8 @@ class MainScene extends Phaser.Scene {
   }
 
   create() {
-    // ===== 迷路（S=Start, G=Goal, #=Wall, .=Floor） =====
-    const map = [
+    // ==== 迷路定義（S=Start, G=Goal, #=Wall, .=Floor） ====
+    this.map = [
       '#################',
       '#S..#.....#....G#',
       '#.#.#.###.#.#####',
@@ -23,24 +23,8 @@ class MainScene extends Phaser.Scene {
       '#.....#...#...#.#',
       '#################',
     ];
-    const rows = map.length;
-    const cols = map[0].length;
 
-    // ===== 画面に収まるスケール（②でレスポンシブを本格対応予定）=====
-    const margin = 16;
-    const tileSize = Math.max(
-      18,
-      Math.floor(Math.min(
-        (this.scale.width - margin * 2) / cols,
-        (this.scale.height - margin * 2) / rows
-      ))
-    );
-    const mapW = cols * tileSize;
-    const mapH = rows * tileSize;
-    const offsetX = Math.floor(this.scale.width / 2 - mapW / 2);
-    const offsetY = Math.floor(this.scale.height / 2 - mapH / 2);
-
-    // ===== iOSモーションセンサー許可 =====
+    // ==== 端末傾き ====
     this.tilt = { x: 0, y: 0 };
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
@@ -59,7 +43,7 @@ class MainScene extends Phaser.Scene {
         window.addEventListener('deviceorientation', (e) => {
           this.tilt.x = (e.gamma || 0) * 0.06;
           this.tilt.y = (e.beta  || 0) * 0.06;
-        });
+        }, { passive: true });
         btn.remove();
       } catch (e) {
         console.error(e);
@@ -67,24 +51,59 @@ class MainScene extends Phaser.Scene {
       }
     };
 
-    // ===== 壁・S/G 生成（★refreshBodyで当たり判定を確実に同期） =====
-    this.walls = this.physics.add.staticGroup();
-    let startPos = { x: this.scale.width / 2, y: this.scale.height / 2 };
-    let goalPos = null;
+    // ==== レイアウト構築（画面サイズ依存） ====
+    this.buildLayout();
 
+    // ==== リサイズで安全に再レイアウト ====
+    this.scale.on('resize', () => {
+      // ボタンが重複しないように一旦消す
+      document.querySelectorAll('button').forEach(b => (b.innerText.includes('Enable Motion') ? b.remove() : null));
+      this.scene.restart(); // 画面サイズを取り直して最初から描画
+    });
+  }
+
+  buildLayout() {
+    const rows = this.map.length;
+    const cols = this.map[0].length;
+
+    // iOSバーの出入りで innerHeight が変動するため、scale.gameSize から取得
+    const viewW = Math.max(1, Math.floor(this.scale.gameSize.width));
+    const viewH = Math.max(1, Math.floor(this.scale.gameSize.height));
+
+    const margin = 16;
+    const tileSize = Math.max(
+      18,
+      Math.floor(Math.min(
+        (viewW - margin * 2) / cols,
+        (viewH - margin * 2) / rows
+      ))
+    );
+    const mapW = cols * tileSize;
+    const mapH = rows * tileSize;
+    const offsetX = Math.floor(viewW / 2 - mapW / 2);
+    const offsetY = Math.floor(viewH / 2 - mapH / 2);
+
+    // --- ヘルパ ---
     const cellToWorld = (cx, cy) => ({
       x: offsetX + cx * tileSize + tileSize / 2,
       y: offsetY + cy * tileSize + tileSize / 2,
     });
 
-    map.forEach((row, y) => {
+    // ==== 物理セットアップ ====
+    this.physics.world.setFPS(180);
+
+    // ==== 壁配置 ====
+    this.walls = this.physics.add.staticGroup();
+    let startPos = { x: viewW / 2, y: viewH / 2 };
+    let goalPos = null;
+
+    this.map.forEach((row, y) => {
       [...row].forEach((cell, x) => {
         const { x: cx, y: cy } = cellToWorld(x, y);
         if (cell === '#') {
           const wall = this.add.rectangle(cx, cy, tileSize, tileSize, 0x555555);
-          this.physics.add.existing(wall, true); // static body
-          // ★ 表示サイズ・位置と物理ボディを同期（これが無いと微ズレが起こりうる）
-          wall.refreshBody();
+          this.physics.add.existing(wall, true);  // static body
+          wall.refreshBody();                      // ★見た目と物理の同期
           this.walls.add(wall);
         } else if (cell === 'S') {
           startPos = { x: cx, y: cy };
@@ -94,29 +113,24 @@ class MainScene extends Phaser.Scene {
       });
     });
 
-    // ===== プレイヤー（タマコロちゃん）— 安定化チューニング =====
-    // 通路幅1タイルに対し、直径を0.76タイル（半径0.38）にして余裕を作る
-    const ballR = Math.floor(tileSize * 0.38);
+    // ==== プレイヤー（タマコロちゃん） ====
+    const ballR = Math.floor(tileSize * 0.38); // 通路幅より少し余裕
     const ballD = ballR * 2;
-
     this.ball = this.physics.add.image(startPos.x, startPos.y, 'ball');
     this.ball.setDisplaySize(ballD, ballD);
-    this.ball.body.setCircle(ballR);            // 円形コリジョン
+    this.ball.body.setCircle(ballR);
     this.ball.body.setCollideWorldBounds(true);
+    this.ball.body.setMaxVelocity(200, 200);
+    this.ball.body.setBounce(0.2);
+    this.ball.body.setDamping(true);
+    this.ball.body.setDrag(220, 220);
 
-    // ★ 物理の安定性を高める
-    this.physics.world.setFPS(180);             // 物理更新を高速化（120→180）
-    this.ball.body.setMaxVelocity(200, 200);    // 最大速度を抑える
-    this.ball.body.setBounce(0.2);              // はね返り控えめ
-    this.ball.body.setDamping(true);            // 減衰ON
-    this.ball.body.setDrag(220, 220);           // ドラッグ強めで暴れにくく
-
-    // ===== ゴール =====
+    // ==== ゴール ====
     const goalR = Math.max(10, Math.floor(tileSize * 0.35));
     this.goal = this.add.circle(goalPos?.x || startPos.x, goalPos?.y || startPos.y, goalR, 0x00ff66);
     this.physics.add.existing(this.goal, true);
 
-    // ===== ゾンビ（赤丸：③で画像差し替え予定） =====
+    // ==== ゾンビ（③で画像差し替え予定） ====
     const zombieR = Math.floor(tileSize * 0.40);
     const zSpawn = goalPos || cellToWorld(cols - 2, rows - 2);
     this.zombie = this.add.circle(zSpawn.x, zSpawn.y, zombieR, 0xff4d4d);
@@ -124,14 +138,14 @@ class MainScene extends Phaser.Scene {
     this.zombie.body.setCircle(zombieR);
     this.zombie.body.setCollideWorldBounds(true);
 
-    // ===== コリジョン・判定 =====
+    // ==== 衝突・判定 ====
     this.physics.add.collider(this.ball, this.walls);
     this.physics.add.collider(this.zombie, this.walls);
 
     this.physics.add.overlap(this.ball, this.goal, () => {
-      this.add.text(this.scale.width / 2, this.scale.height / 2, 'GOAL! 🎉', {
+      this.add.text(viewW / 2, viewH / 2, 'GOAL! 🎉', {
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(this.scale.width * 0.08) + 'px',
+        fontSize: Math.floor(viewW * 0.08) + 'px',
         color: '#00ff66',
         stroke: '#003300',
         strokeThickness: 2,
@@ -140,9 +154,9 @@ class MainScene extends Phaser.Scene {
     });
 
     this.physics.add.overlap(this.ball, this.zombie, () => {
-      this.add.text(this.scale.width / 2, this.scale.height / 2, 'GAME OVER 💀', {
+      this.add.text(viewW / 2, viewH / 2, 'GAME OVER 💀', {
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(this.scale.width * 0.08) + 'px',
+        fontSize: Math.floor(viewW * 0.08) + 'px',
         color: '#ff4d4d',
         stroke: '#330000',
         strokeThickness: 2,
@@ -150,7 +164,7 @@ class MainScene extends Phaser.Scene {
       this.time.delayedCall(1100, () => this.scene.restart());
     });
 
-    // ===== ゾンビの簡易追跡（速度控えめ） =====
+    // ==== ゾンビ追跡（簡易） ====
     const ZOMBIE_SPEED = Math.max(50, Math.floor(tileSize * 2.2));
     this.time.addEvent({
       delay: 500, loop: true,
@@ -165,23 +179,27 @@ class MainScene extends Phaser.Scene {
         }
       },
     });
+
+    // update で参照できるよう保存
+    this.ACCEL = 560;
   }
 
   update() {
     if (!this.ball?.body) return;
-
-    // 直接速度をドン！ではなく、加速度でじわっと動かしてトンネル化を抑制
-    const ACCEL = 560; // お好みで 500〜800 の範囲で微調整
-    this.ball.body.setAcceleration(this.tilt.x * ACCEL, this.tilt.y * ACCEL);
+    this.ball.body.setAcceleration(this.tilt.x * this.ACCEL, this.tilt.y * this.ACCEL);
   }
 }
 
-// ===== ゲーム起動 =====
+// ==== ゲーム起動（RESIZEモードで常に画面にフィット） ====
 const game = new Phaser.Game({
   type: Phaser.AUTO,
-  width: window.innerWidth,
-  height: window.innerHeight,
   backgroundColor: '#111',
+  scale: {
+    mode: Phaser.Scale.RESIZE,   // 画面サイズに追従
+    autoCenter: Phaser.Scale.CENTER_BOTH,
+    width: window.innerWidth,
+    height: window.innerHeight,
+  },
   physics: {
     default: 'arcade',
     arcade: {
