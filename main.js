@@ -4,18 +4,19 @@ import tamakoroPng from './tamakoro.png';
 class MainScene extends Phaser.Scene {
   constructor() {
     super('main');
-    this.tilt   = { x: 0, y: 0 };
+    this.tilt = { x: 0, y: 0 };
     this.smooth = { x: 0, y: 0 };
-    this.alpha  = 0.18;     // 応答（0.12〜0.25）
-    this.forceK = 0.00045;  // 加える力（暴れを抑える）
-    this.maxSpeed = 7.5;    // 最高速度（さらに暴走抑止）
+    this.alpha = 0.18;        // 反応
+    this.forceK = 0.0005;     // 力
+    this.maxSpeed = 8.0;      // 最高速
     this.startPos = { x: 0, y: 0 };
+    this.motionEnabledAt = 0; // 許可時刻（クールダウンに使用）
   }
 
   preload() { this.load.image('ball', tamakoroPng); }
 
   create() {
-    // 迷路（S=Start, G=Goal, #=Wall）
+    // 迷路（外周は # で囲う）
     this.map = [
       '#################',
       '#S..#.....#....G#',
@@ -30,14 +31,15 @@ class MainScene extends Phaser.Scene {
       '#################',
     ];
 
-    // iOS：センサー許可
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
       typeof DeviceMotionEvent.requestPermission === 'function';
+
     const btn = document.createElement('button');
     btn.innerText = 'Enable Motion (iOS)';
     Object.assign(btn.style, { position:'fixed', top:'10px', left:'10px', zIndex:10, padding:'8px 12px' });
     document.body.appendChild(btn);
+
     btn.onclick = async () => {
       try {
         if (needIOSPermission) {
@@ -45,17 +47,15 @@ class MainScene extends Phaser.Scene {
           if (DeviceOrientationEvent?.requestPermission) await DeviceOrientationEvent.requestPermission();
         }
         this.setupSensors();
-        this.resetPlayerToStart();   // 許可直後に安全初期化
+        this.resetPlayerToStart();
+        this.motionEnabledAt = performance.now();  // ← クールダウン開始
         btn.remove();
-      } catch (e) {
-        console.error(e); alert('Motion permission failed.');
-      }
+      } catch (e) { console.error(e); alert('Motion permission failed.'); }
     };
 
-    // レイアウト構築
     this.build();
 
-    // リサイズは軽くリスタート（デバウンス）
+    // リサイズ時は軽くリスタート
     let t=null;
     const onResize=()=>{ clearTimeout(t); t=setTimeout(()=>this.scene.restart(),150); };
     window.addEventListener('resize', onResize, {passive:true});
@@ -63,7 +63,7 @@ class MainScene extends Phaser.Scene {
   }
 
   setupSensors() {
-    // 主に devicemotion を使用
+    // devicemotion 優先
     window.addEventListener('devicemotion', (e) => {
       const g = e.accelerationIncludingGravity; if (!g) return;
       const portrait = window.matchMedia('(orientation: portrait)').matches;
@@ -97,15 +97,14 @@ class MainScene extends Phaser.Scene {
     const offsetY = Math.floor(viewH/2 - mapH/2);
     const toWorld = (cx,cy)=>({ x: offsetX + cx*tile + tile/2, y: offsetY + cy*tile + tile/2 });
 
-    // Matter パラメータを強めに（すり抜け/めり込み対策）
-    this.matter.world.engine.positionIterations = 10; // 既定6
-    this.matter.world.engine.velocityIterations = 10; // 既定4
-    this.matter.world.engine.constraintIterations = 4;
+    // Matter 強化（トンネリング耐性）
+    this.matter.world.engine.positionIterations = 10;
+    this.matter.world.engine.velocityIterations = 10;
     this.matter.world.engine.world.gravity.x = 0;
     this.matter.world.engine.world.gravity.y = 0;
 
-    // ★ ワールド境界は迷路より少し外（±2px）だけに設定（外枠の追加壁は置かない）
-    this.matter.world.setBounds(offsetX-2, offsetY-2, mapW+4, mapH+4, 0, true, true, true, true);
+    // 画面の外周境界は OFF（迷路外に出る前に次の“外側壁”で止める）
+    this.matter.world.setBounds(0, 0, viewW, viewH, 0);
 
     // 背景
     this.add.rectangle(offsetX + mapW/2, offsetY + mapH/2, mapW, mapH, 0x111111);
@@ -115,13 +114,23 @@ class MainScene extends Phaser.Scene {
       const {x:wx,y:wy}=toWorld(x,y);
       if(c==='#'){
         this.matter.add.rectangle(wx, wy, tile, tile, {
-          isStatic:true, label:'wall',
-          friction: 0, frictionStatic: 0, restitution: 0,
-          chamfer: 0
+          isStatic:true, label:'wall', friction:0, frictionStatic:0, restitution:0
         });
         this.add.rectangle(wx, wy, tile, tile, 0x555555);
       }
     });});
+
+    // ★ 迷路の「さらに外側」に見えない厚い壁を配置（通路とは干渉しない）
+    const B = tile * 2; // 十分厚くして脱走防止
+    const outerLeft   = offsetX - B/2;
+    const outerRight  = offsetX + mapW + B/2;
+    const outerTop    = offsetY - B/2;
+    const outerBottom = offsetY + mapH + B/2;
+    const addBorder = (x,y,w,h)=>this.matter.add.rectangle(x,y,w,h,{isStatic:true,label:'outer',render:{visible:false}});
+    addBorder(offsetX + mapW/2, outerTop,    mapW + B*2, B); // 上
+    addBorder(offsetX + mapW/2, outerBottom, mapW + B*2, B); // 下
+    addBorder(outerLeft,  offsetY + mapH/2, B, mapH + B*2);  // 左
+    addBorder(outerRight, offsetY + mapH/2, B, mapH + B*2);  // 右
 
     // スタート/ゴール
     let start=toWorld(1,1), goal=toWorld(cols-2,1);
@@ -135,12 +144,12 @@ class MainScene extends Phaser.Scene {
     this.goalBody = this.matter.add.circle(goal.x, goal.y, goalR, {isStatic:true, label:'goal'});
     this.add.circle(goal.x, goal.y, goalR, 0x00ff66);
 
-    // プレイヤー（回転の慣性を無効化して安定）
+    // プレイヤー
     const r = Math.floor(tile*0.38);
     this.ball = this.matter.add.image(start.x, start.y, 'ball', null, {
       shape:{ type:'circle', radius:r },
       restitution: 0.08,
-      frictionAir: 0.10,     // 空気抵抗を強め
+      frictionAir: 0.10,
       friction: 0.002,
       label:'ball'
     });
@@ -164,6 +173,9 @@ class MainScene extends Phaser.Scene {
         if(hitZombie){ this.centerText('GAME OVER 💀','#f55','#300'); this.time.delayedCall(900,()=>this.scene.restart()); return; }
       }
     });
+
+    // 画面サイズ・位置を後で使うため保存
+    this._geom = { offsetX, offsetY, mapW, mapH };
   }
 
   resetPlayerToStart() {
@@ -180,15 +192,19 @@ class MainScene extends Phaser.Scene {
     this.add.text(w/2,h/2,msg,{fontFamily:'system-ui,-apple-system,sans-serif',fontSize:Math.floor(w*0.08)+'px',color,stroke,strokeThickness:2}).setOrigin(0.5);
   }
 
-  update() {
+  update(time) {
     if(!this.ball?.body) return;
+
+    // 許可直後は力を加えない（スパイク無効化）
+    if (this.motionEnabledAt && time - this.motionEnabledAt < 600) return;
 
     // ローパス
     this.smooth.x += this.alpha * (this.tilt.x - this.smooth.x);
     this.smooth.y += this.alpha * (this.tilt.y - this.smooth.y);
 
-    // 力を加える
     const Body = Phaser.Physics.Matter.Matter.Body;
+
+    // 力を加える
     Body.applyForce(this.ball.body, this.ball.body.position, {
       x: this.smooth.x * this.forceK,
       y: this.smooth.y * this.forceK
@@ -210,7 +226,7 @@ class MainScene extends Phaser.Scene {
   }
 }
 
-// 起動（Matter）
+// 起動
 new Phaser.Game({
   type: Phaser.AUTO,
   backgroundColor: '#111',
