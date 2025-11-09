@@ -4,12 +4,11 @@ import tamakoroPng from './tamakoro.png';
 class MainScene extends Phaser.Scene {
   constructor() {
     super('main');
-    this.walls = null;
-    this.ball = null;
-    this.zombie = null;
-    this.goal = null;
-    this.ACCEL = 560;
-    this._resizeTimer = null;
+    this.tilt = { x: 0, y: 0 };      // センサーからの傾き（生値）
+    this.smooth = { x: 0, y: 0 };    // ローパス後
+    this.alpha = 0.12;               // スムージング係数（大きいほど反応早い）
+    this.forceK = 0.0008;            // 力のスケール（端末傾き→加える力）
+    this.maxSpeed = 10.5;            // 最高速度（Matterの単位）
   }
 
   preload() {
@@ -17,7 +16,7 @@ class MainScene extends Phaser.Scene {
   }
 
   create() {
-    // 迷路（S: Start, G: Goal, #: Wall, .: Floor）
+    // ===== 迷路定義（S=Start, G=Goal, #=Wall） =====
     this.map = [
       '#################',
       '#S..#.....#....G#',
@@ -32,8 +31,7 @@ class MainScene extends Phaser.Scene {
       '#################',
     ];
 
-    // ジャイロ
-    this.tilt = { x: 0, y: 0 };
+    // ===== センサー許可（iOS） =====
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
       typeof DeviceMotionEvent.requestPermission === 'function';
@@ -41,21 +39,17 @@ class MainScene extends Phaser.Scene {
     const btn = document.createElement('button');
     btn.innerText = 'Enable Motion (iOS)';
     Object.assign(btn.style, {
-      position: 'fixed', top: '10px', left: '10px',
-      zIndex: 10, padding: '8px 12px'
+      position: 'fixed', top: '10px', left: '10px', zIndex: 10,
+      padding: '8px 12px'
     });
     document.body.appendChild(btn);
-
     btn.onclick = async () => {
       try {
         if (needIOSPermission) {
           if (DeviceMotionEvent.requestPermission) await DeviceMotionEvent.requestPermission();
           if (DeviceOrientationEvent?.requestPermission) await DeviceOrientationEvent.requestPermission();
         }
-        window.addEventListener('deviceorientation', (e) => {
-          this.tilt.x = (e.gamma || 0) * 0.06;
-          this.tilt.y = (e.beta  || 0) * 0.06;
-        }, { passive: true });
+        this.setupSensors();
         btn.remove();
       } catch (e) {
         console.error(e);
@@ -63,157 +57,214 @@ class MainScene extends Phaser.Scene {
       }
     };
 
-    // 物理の安定化
-    this.physics.world.setFPS(180);
-
-    // 初期レイアウト（少し遅延）
-    this.time.delayedCall(60, () => this.buildOrRebuild());
-
-    // リサイズはデバウンスで再レイアウト（restartしない）
+    // ===== レイアウト構築（画面サイズからタイルサイズ決定） =====
+    this.buildLayout();
+    // リサイズはデバウンスで安全に再構築
+    let t = null;
     const onResize = () => {
-      clearTimeout(this._resizeTimer);
-      this._resizeTimer = setTimeout(() => {
-        this.scale.resize(window.innerWidth, window.innerHeight);
-        this.buildOrRebuild();
-      }, 160);
+      clearTimeout(t);
+      t = setTimeout(() => {
+        this.scene.restart();
+      }, 150);
     };
     window.addEventListener('resize', onResize, { passive: true });
     window.visualViewport?.addEventListener('resize', onResize, { passive: true });
   }
 
-  getViewSize() {
-    const vw = Math.floor(window.visualViewport?.width  ?? window.innerWidth  ?? this.scale.width  ?? 1);
-    const vh = Math.floor(window.visualViewport?.height ?? window.innerHeight ?? this.scale.height ?? 1);
-    return { vw: Math.max(1, vw), vh: Math.max(1, vh) };
+  setupSensors() {
+    // devicemotion（重力込み加速度）を優先：反応が早くて滑らか
+    const useMotion = (e) => {
+      const g = e.accelerationIncludingGravity;
+      if (!g) return;
+      // 端末が縦持ちを想定：X→左右、Y→前後。向きに応じて調整
+      const portrait = window.matchMedia('(orientation: portrait)').matches;
+      const ax = portrait ? g.x : g.y;
+      const ay = portrait ? g.y : -g.x;
+
+      // 過剰に大きい値はクランプ
+      const clamp = (v, m) => Math.max(-m, Math.min(m, v));
+      this.tilt.x = clamp(ax, 9.8);
+      this.tilt.y = clamp(ay, 9.8);
+    };
+
+    const useOrientation = (e) => {
+      // フォールバック（度数→弱めの係数）
+      const portrait = window.matchMedia('(orientation: portrait)').matches;
+      const gamma = (e.gamma || 0) * 0.12;
+      const beta  = (e.beta  || 0) * 0.12;
+      this.tilt.x = portrait ? gamma : beta;
+      this.tilt.y = portrait ? beta  : -gamma;
+    };
+
+    window.addEventListener('devicemotion', useMotion, { passive: true });
+    window.addEventListener('deviceorientation', useOrientation, { passive: true });
   }
 
-  buildOrRebuild() {
-    // 既存を破棄
-    if (this.walls) { this.walls.clear(true, true); this.walls = null; }
-    this.ball?.destroy();   this.ball   = null;
-    this.zombie?.destroy(); this.zombie = null;
-    this.goal?.destroy();   this.goal   = null;
-
+  buildLayout() {
     const rows = this.map.length;
     const cols = this.map[0].length;
 
-    const { vw, vh } = this.getViewSize();
+    const viewW = Math.floor(window.visualViewport?.width  ?? window.innerWidth);
+    const viewH = Math.floor(window.visualViewport?.height ?? window.innerHeight);
 
     const margin = 16;
     const tileSize = Math.max(
       18,
       Math.floor(Math.min(
-        (vw - margin * 2) / cols,
-        (vh - margin * 2) / rows
+        (viewW - margin * 2) / cols,
+        (viewH - margin * 2) / rows
       ))
     );
-
     const mapW = cols * tileSize;
     const mapH = rows * tileSize;
-    const offsetX = Math.floor(vw / 2 - mapW / 2);
-    const offsetY = Math.floor(vh / 2 - mapH / 2);
+    const offsetX = Math.floor(viewW / 2 - mapW / 2);
+    const offsetY = Math.floor(viewH / 2 - mapH / 2);
 
+    // ===== Matter 物理設定 =====
+    this.matter.world.setBounds(0, 0, viewW, viewH, 32, true, true, true, true);
+    this.matter.world.engine.world.gravity.x = 0;
+    this.matter.world.engine.world.gravity.y = 0;
+    this.matter.world.engine.timing.timeScale = 1;
+
+    // ===== 壁を Matter の静的矩形で作成（すり抜け最強） =====
+    this.walls = [];
     const toWorld = (cx, cy) => ({
       x: offsetX + cx * tileSize + tileSize / 2,
       y: offsetY + cy * tileSize + tileSize / 2,
     });
 
-    // 壁
-    this.walls = this.physics.add.staticGroup();
-
-    let startPos = { x: vw / 2, y: vh / 2 };
-    let goalPos = null;
+    let start = { x: viewW / 2, y: viewH / 2 };
+    let goal  = null;
 
     this.map.forEach((row, y) => {
       [...row].forEach((cell, x) => {
-        const { x: cx, y: cy } = toWorld(x, y);
+        const { x: wx, y: wy } = toWorld(x, y);
         if (cell === '#') {
-          const wall = this.add.rectangle(cx, cy, tileSize, tileSize, 0x555555);
-          this.physics.add.existing(wall, true);      // static body を付与
-          wall.body.updateFromGameObject();           // ← ★ここが修正点（refreshBodyではなくこれ）
-          this.walls.add(wall);
+          const body = this.matter.add.rectangle(wx, wy, tileSize, tileSize, {
+            isStatic: true,
+            chamfer: 0,               // 角丸なし（必要なら少しだけ 2〜4）
+            friction: 0,
+            frictionStatic: 0,
+            restitution: 0,
+            label: 'wall',
+          });
+          this.walls.push(body);
+          // 見た目の四角（任意）
+          this.add.rectangle(wx, wy, tileSize, tileSize, 0x555555);
         } else if (cell === 'S') {
-          startPos = { x: cx, y: cy };
+          start = { x: wx, y: wy };
         } else if (cell === 'G') {
-          goalPos = { x: cx, y: cy };
+          goal  = { x: wx, y: wy };
         }
       });
     });
 
-    // プレイヤー（タマコロ）
-    const ballR = Math.floor(tileSize * 0.38);
-    const ballD = ballR * 2;
-
-    this.ball = this.physics.add.image(startPos.x, startPos.y, 'ball');
-    this.ball.setDisplaySize(ballD, ballD);
-    this.ball.body.setCircle(ballR);
-    this.ball.body.setCollideWorldBounds(true);
-    this.ball.body.setMaxVelocity(200, 200);
-    this.ball.body.setBounce(0.2);
-    this.ball.body.setDamping(true);
-    this.ball.body.setDrag(220, 220);
-
-    // ゴール
+    // ===== ゴール（静的円） =====
     const goalR = Math.max(10, Math.floor(tileSize * 0.35));
-    this.goal = this.add.circle(goalPos?.x || startPos.x, goalPos?.y || startPos.y, goalR, 0x00ff66);
-    this.physics.add.existing(this.goal, true);
-
-    // ゾンビ（仮）
-    const zombieR = Math.floor(tileSize * 0.40);
-    const zSpawn = goalPos || toWorld(cols - 2, rows - 2);
-    this.zombie = this.add.circle(zSpawn.x, zSpawn.y, zombieR, 0xff4d4d);
-    this.physics.add.existing(this.zombie);
-    this.zombie.body.setCircle(zombieR);
-    this.zombie.body.setCollideWorldBounds(true);
-
-    // 当たり
-    this.physics.add.collider(this.ball, this.walls);
-    this.physics.add.collider(this.zombie, this.walls);
-
-    this.physics.add.overlap(this.ball, this.goal, () => {
-      this.add.text(vw / 2, vh / 2, 'GOAL! 🎉', {
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(vw * 0.08) + 'px',
-        color: '#00ff66',
-        stroke: '#003300',
-        strokeThickness: 2,
-      }).setOrigin(0.5);
-      this.time.delayedCall(1100, () => this.buildOrRebuild());
+    this.add.circle(goal?.x ?? start.x, goal?.y ?? start.y, goalR, 0x00ff66);
+    this.goalBody = this.matter.add.circle(goal?.x ?? start.x, goal?.y ?? start.y, goalR, {
+      isStatic: true, label: 'goal'
     });
 
-    this.physics.add.overlap(this.ball, this.zombie, () => {
-      this.add.text(vw / 2, vh / 2, 'GAME OVER 💀', {
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(vw * 0.08) + 'px',
-        color: '#ff4d4d',
-        stroke: '#330000',
-        strokeThickness: 2,
-      }).setOrigin(0.5);
-      this.time.delayedCall(1100, () => this.buildOrRebuild());
+    // ===== プレイヤー：タマコロ（円） =====
+    const ballR = Math.floor(tileSize * 0.38);
+    this.ball = this.matter.add.image(start.x, start.y, 'ball', null, {
+      shape: { type: 'circle', radius: ballR },
+      restitution: 0.15,
+      frictionAir: 0.06,     // 空気抵抗（減速）
+      friction: 0.001,
+      frictionStatic: 0,
+      label: 'ball'
+    });
+    this.ball.setDisplaySize(ballR * 2, ballR * 2);
+
+    // ===== ゾンビ（仮：赤丸） =====
+    const zR = Math.floor(tileSize * 0.40);
+    const zSpawn = goal ?? toWorld(cols - 2, rows - 2);
+    this.zombieGfx = this.add.circle(zSpawn.x, zSpawn.y, zR, 0xff4d4d);
+    this.zombie = this.matter.add.circle(zSpawn.x, zSpawn.y, zR, {
+      restitution: 0.05,
+      frictionAir: 0.05,
+      label: 'zombie'
     });
 
-    // 追跡
-    const ZOMBIE_SPEED = Math.max(50, Math.floor(tileSize * 2.2));
-    this.time.addEvent({
-      delay: 500, loop: true,
-      callback: () => {
-        if (!this.ball || !this.zombie) return;
-        const dx = this.ball.x - this.zombie.x;
-        const dy = this.ball.y - this.zombie.y;
-        const dist = Math.hypot(dx, dy);
-        if (dist > 5) this.zombie.body.setVelocity((dx / dist) * ZOMBIE_SPEED, (dy / dist) * ZOMBIE_SPEED);
-        else this.zombie.body.setVelocity(0, 0);
-      },
+    // ===== 衝突イベント =====
+    this.matter.world.on('collisionstart', (evt) => {
+      for (const pair of evt.pairs) {
+        const A = pair.bodyA.label;
+        const B = pair.bodyB.label;
+        const hitGoal =
+          (A === 'ball' && B === 'goal') ||
+          (A === 'goal' && B === 'ball');
+        const hitZombie =
+          (A === 'ball' && B === 'zombie') ||
+          (A === 'zombie' && B === 'ball');
+        if (hitGoal) {
+          this.showCenterText('GOAL! 🎉', '#00ff66', '#003300');
+          this.time.delayedCall(900, () => this.scene.restart());
+          return;
+        }
+        if (hitZombie) {
+          this.showCenterText('GAME OVER 💀', '#ff4d4d', '#330000');
+          this.time.delayedCall(900, () => this.scene.restart());
+          return;
+        }
+      }
     });
+  }
+
+  showCenterText(msg, color, stroke) {
+    const w = Math.floor(window.visualViewport?.width  ?? window.innerWidth);
+    const h = Math.floor(window.visualViewport?.height ?? window.innerHeight);
+    this.add.text(w / 2, h / 2, msg, {
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      fontSize: Math.floor(w * 0.08) + 'px',
+      color,
+      stroke,
+      strokeThickness: 2
+    }).setOrigin(0.5);
   }
 
   update() {
-    if (!this.ball?.body) return;
-    this.ball.body.setAcceleration(this.tilt.x * this.ACCEL, this.tilt.y * this.ACCEL);
+    if (!this.ball) return;
+
+    // ===== センサー値をローパスして滑らかに =====
+    this.smooth.x = this.smooth.x + this.alpha * (this.tilt.x - this.smooth.x);
+    this.smooth.y = this.smooth.y + this.alpha * (this.tilt.y - this.smooth.y);
+
+    // ===== タマコロに力を加える（反応良く、すり抜けなし） =====
+    const Body = Phaser.Physics.Matter.Matter.Body;
+    const forceX = this.smooth.x * this.forceK;
+    const forceY = this.smooth.y * this.forceK;
+    Body.applyForce(this.ball.body, this.ball.body.position, { x: forceX, y: forceY });
+
+    // 最高速度をクランプ（暴走防止）
+    const v = this.ball.body.velocity;
+    const speed = Math.hypot(v.x, v.y);
+    if (speed > this.maxSpeed) {
+      const scale = this.maxSpeed / speed;
+      Body.setVelocity(this.ball.body, { x: v.x * scale, y: v.y * scale });
+    }
+
+    // ゾンビを追従（簡易に速度を向ける）
+    if (this.zombie && this.zombieGfx) {
+      const zv = this.zombie.velocity;
+      const dx = this.ball.body.position.x - this.zombie.position.x;
+      const dy = this.ball.body.position.y - this.zombie.position.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      const speedZ = 6.5; // 追跡速度
+      Phaser.Physics.Matter.Matter.Body.setVelocity(this.zombie, {
+        x: (dx / dist) * speedZ,
+        y: (dy / dist) * speedZ
+      });
+      // 描画位置同期
+      this.zombieGfx.x = this.zombie.position.x;
+      this.zombieGfx.y = this.zombie.position.y;
+    }
   }
 }
 
-// 起動（FIT + CENTER_BOTH）
+// ===== 起動（Matter 物理） =====
 const game = new Phaser.Game({
   type: Phaser.AUTO,
   backgroundColor: '#111',
@@ -224,12 +275,11 @@ const game = new Phaser.Game({
     height: window.innerHeight,
   },
   physics: {
-    default: 'arcade',
-    arcade: {
-      fps: 180,
+    default: 'matter',
+    matter: {
       gravity: { x: 0, y: 0 },
-      // debug: true,
-    },
+      enableSleep: true
+    }
   },
   scene: MainScene,
 });
