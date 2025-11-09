@@ -5,37 +5,45 @@ class MainScene extends Phaser.Scene {
   constructor() {
     super('main');
 
-    // センサー/フィルタ
+    // センサー関連
     this.tilt   = { x: 0, y: 0 };   // 生
     this.smooth = { x: 0, y: 0 };   // ローパス
-    this.alpha  = 0.14;             // 応答（少し速め）
-    this.deadZone = 0.08;           // 微小ノイズを殺す
+    this.alpha  = 0.10;             // ローパス係数（小さめ＝なめらか）
+    this.deadZone = 0.18;           // 微小揺れはゼロ扱い
 
-    // キャリブ用
+    // キャリブ（基準取り）
     this.bias = { x: 0, y: 0 };
     this.calibrating = false;
     this.calibSamples = [];
 
     // 動作制御
-    this.motionActive = false;      // 力を加えるフラグ
+    this.motionActive = false;      // 力を加える許可
     this.motionEnabledAt = 0;
 
-    // 物理パラメータ（控えめ）
-    this.forceK   = 0.00042;
-    this.maxSpeed = 7.2;
+    // 静止検出（rest detect）
+    this.recentApply = [];          // 直近の apply 値 N 件を保持
+    this.REST_WINDOW = 30;          // 判定窓サイズ（フレーム数）
+    this.REST_STD    = 0.02;        // 標準偏差しきい値（これ未満＝静止）
+    this.restLock    = true;        // 静止ロック中なら力を加えない
+    this.restSince   = 0;           // 静止状態になっている開始時刻
+    this.REST_MIN_MS = 300;         // 最低静止時間（チャタリング防止）
 
-    // 迷路情報
+    // 物理
+    this.forceK   = 0.00038;
+    this.maxSpeed = 6.8;
+
+    // 迷路
     this.startPos  = { x: 0, y: 0 };
     this.innerRect = null;
 
-    // デバッグHUD
+    // HUD
     this.debugText = null;
   }
 
   preload() { this.load.image('ball', tamakoroPng); }
 
   create() {
-    // 迷路
+    // 迷路（S=Start, G=Goal, #=Wall）
     this.map = [
       '#################',
       '#S..#.....#....G#',
@@ -73,31 +81,33 @@ class MainScene extends Phaser.Scene {
         }
         this.setupSensors();
         this.resetPlayerToStart();
-        this.startCalibration(1000);          // 許可直後1秒キャリブ
-        this.motionActive = false;            // キャリブ中はオフ
+        this.startCalibration(1000);      // 許可直後1秒キャリブ
+        this.motionActive = false;        // キャリブ中は停止
         setTimeout(() => { this.motionActive = true; }, 1200);
         permBtn.remove();
       } catch (e) { console.error(e); alert('Motion permission failed.'); }
     };
 
     calibBtn.onclick = () => {
-      this.startCalibration(700);
+      this.startCalibration(800);
       this.motionActive = false;
       this.resetPlayerToStart();
-      setTimeout(() => { this.motionActive = true; }, 900);
+      setTimeout(() => { this.motionActive = true; }, 950);
     };
 
     // 迷路・物理構築
     this.build();
 
-    // デバッグHUD
-    this.debugText = this.add.text(8, 8, 'debug', {
+    // HUD（小さめフォント・複数行）
+    this.debugText = this.add.text(8, 8, '', {
       fontFamily: 'system-ui,-apple-system,sans-serif',
-      fontSize: '12px',
-      color: '#0f0'
+      fontSize: '11px',
+      color: '#0f0',
+      align: 'left',
+      wordWrap: { width: Math.max(220, window.innerWidth * 0.6) }
     }).setDepth(1000).setScrollFactor(0);
 
-    // リサイズは軽くリスタート
+    // リサイズで軽く再起動
     let t=null;
     const onResize=()=>{ clearTimeout(t); t=setTimeout(()=>this.scene.restart(),150); };
     window.addEventListener('resize', onResize, {passive:true});
@@ -105,7 +115,7 @@ class MainScene extends Phaser.Scene {
   }
 
   setupSensors() {
-    // devicemotion 優先（重力込み）
+    // devicemotion（重力込み）をメイン
     window.addEventListener('devicemotion', (e) => {
       const g = e.accelerationIncludingGravity; if (!g) return;
       const portrait = window.matchMedia('(orientation: portrait)').matches;
@@ -118,14 +128,13 @@ class MainScene extends Phaser.Scene {
       this.tilt.y = ay - this.bias.y;
     }, { passive:true });
 
-    // フォールバック（弱めに寄与）
+    // 補助：deviceorientation（弱め寄与）
     window.addEventListener('deviceorientation', (e) => {
       if (this.calibrating) return;
       const portrait = window.matchMedia('(orientation: portrait)').matches;
       const gamma=(e.gamma||0)*0.10, beta=(e.beta||0)*0.10;
       const ox = portrait ? gamma : beta;
       const oy = portrait ? beta  : -gamma;
-      // 加算寄与（メインはdevicemotion）
       this.tilt.x += ox * 0.15;
       this.tilt.y += oy * 0.15;
     }, { passive:true });
@@ -142,8 +151,11 @@ class MainScene extends Phaser.Scene {
         this.bias.y = sy;
       }
       this.calibrating = false;
-      this.smooth.x = 0;
-      this.smooth.y = 0;
+      // ローパスと履歴をリセット
+      this.smooth.x = this.smooth.y = 0;
+      this.recentApply.length = 0;
+      this.restLock = true;     // 静止から再開するまでロック
+      this.restSince = performance.now();
     }, ms);
   }
 
@@ -210,7 +222,7 @@ class MainScene extends Phaser.Scene {
     this.ball.setDisplaySize(r*2, r*2);
     Phaser.Physics.Matter.Matter.Body.setInertia(this.ball.body, Infinity);
 
-    // ゾンビ（安全スポーン）
+    // ゾンビ
     const zR = Math.floor(tile*0.40);
     const zSpawn = toWorld(cols - 2, rows - 2);
     this.zombie = this.matter.add.circle(zSpawn.x, zSpawn.y, zR, {
@@ -228,21 +240,6 @@ class MainScene extends Phaser.Scene {
         if(hitZombie){ this.centerText('GAME OVER 💀','#f55','#300'); this.time.delayedCall(900,()=>this.scene.restart()); return; }
       }
     });
-
-    // ゾンビの「確実な追跡」保険：0.2秒毎に目的地に向けて微力を加える
-    this.time.addEvent({
-      delay: 200,
-      loop: true,
-      callback: () => {
-        if (!this.zombie || !this.ball) return;
-        const Body = Phaser.Physics.Matter.Matter.Body;
-        const dx = this.ball.body.position.x - this.zombie.position.x;
-        const dy = this.ball.body.position.y - this.zombie.position.y;
-        const d = Math.hypot(dx, dy) || 1;
-        const force = 0.0004; // 小さめ
-        Body.applyForce(this.zombie, this.zombie.position, { x: (dx/d)*force, y: (dy/d)*force });
-      }
-    });
   }
 
   resetPlayerToStart() {
@@ -251,6 +248,9 @@ class MainScene extends Phaser.Scene {
     Body.setPosition(this.ball.body, { x: this.startPos.x, y: this.startPos.y });
     Body.setVelocity(this.ball.body, { x: 0, y: 0 });
     this.smooth.x = 0; this.smooth.y = 0;
+    this.recentApply.length = 0;
+    this.restLock = true;
+    this.restSince = performance.now();
   }
 
   centerText(msg,color,stroke){
@@ -259,31 +259,56 @@ class MainScene extends Phaser.Scene {
     this.add.text(w/2,h/2,msg,{fontFamily:'system-ui,-apple-system,sans-serif',fontSize:Math.floor(w*0.08)+'px',color,stroke,strokeThickness:2}).setOrigin(0.5);
   }
 
+  // 最近のapplyの分散/標準偏差を計算
+  calcStd(arr){
+    if (arr.length === 0) return 0;
+    const mean = arr.reduce((s,v)=>s+v,0)/arr.length;
+    const v = arr.reduce((s,v)=>s+(v-mean)*(v-mean),0)/arr.length;
+    return Math.sqrt(v);
+  }
+
   update() {
     if (!this.ball?.body) return;
 
-    // センサー → ローパス
+    // ローパス
     this.smooth.x += this.alpha * (this.tilt.x - this.smooth.x);
     this.smooth.y += this.alpha * (this.tilt.y - this.smooth.y);
 
-    // デッドゾーン
-    const ax = (Math.abs(this.smooth.x) < this.deadZone) ? 0 : this.smooth.x;
-    const ay = (Math.abs(this.smooth.y) < this.deadZone) ? 0 : this.smooth.y;
+    // デッドゾーン → apply 値
+    let ax = (Math.abs(this.smooth.x) < this.deadZone) ? 0 : this.smooth.x;
+    let ay = (Math.abs(this.smooth.y) < this.deadZone) ? 0 : this.smooth.y;
 
-    // デバッグHUD
+    // 静止検出のために合成量を記録
+    const mag = Math.hypot(ax, ay);
+    this.recentApply.push(mag);
+    if (this.recentApply.length > this.REST_WINDOW) this.recentApply.shift();
+
+    // 標準偏差が小さければ静止とみなす
+    const std = this.calcStd(this.recentApply);
+    const now = performance.now();
+    if (std < this.REST_STD) {
+      if (!this.restLock) { this.restLock = true; this.restSince = now; }
+    } else {
+      this.restLock = false;
+    }
+
+    // 静止ロック中は最低 REST_MIN_MS は力をゼロに保つ
+    const lockActive = this.restLock && (now - this.restSince >= this.REST_MIN_MS) ? true : this.restLock;
+
+    // デバッグHUD（複数行）
     const v = this.ball.body.velocity;
-    this.debugText?.setText(
-      `tilt raw=(${this.tilt.x.toFixed(2)}, ${this.tilt.y.toFixed(2)})  ` +
-      `smooth=(${this.smooth.x.toFixed(2)}, ${this.smooth.y.toFixed(2)})  ` +
-      `apply=(${ax.toFixed(2)}, ${ay.toFixed(2)})  ` +
-      `speed=${Math.hypot(v.x,v.y).toFixed(2)}  ` +
-      `active=${this.motionActive}  calib=${this.calibrating}`
-    );
+    const lines = [
+      `tilt raw = (${this.tilt.x.toFixed(2)}, ${this.tilt.y.toFixed(2)})`,
+      `smooth   = (${this.smooth.x.toFixed(2)}, ${this.smooth.y.toFixed(2)})`,
+      `apply    = (${ax.toFixed(2)}, ${ay.toFixed(2)}) | |a|=${mag.toFixed(2)} std=${std.toFixed(3)}`,
+      `speed=${Math.hypot(v.x,v.y).toFixed(2)}  active=${this.motionActive}  calib=${this.calibrating}  rest=${lockActive}`
+    ];
+    this.debugText?.setText(lines.join('\n'));
 
     const Body = Phaser.Physics.Matter.Matter.Body;
 
-    // 力を加える（motionActiveのときだけ）
-    if (this.motionActive) {
+    // 力を加える：許可があり、かつ静止ロックでなければ
+    if (this.motionActive && !lockActive) {
       Body.applyForce(this.ball.body, this.ball.body.position, { x: ax * this.forceK, y: ay * this.forceK });
     }
 
@@ -294,13 +319,13 @@ class MainScene extends Phaser.Scene {
       Body.setVelocity(this.ball.body, { x: v.x * s, y: v.y * s });
     }
 
-    // ゾンビの描画同期
+    // ゾンビ描画同期（追跡は慣性で十分動く想定。必要なら適宜強化）
     if (this.zombie && this.zombieSprite) {
       this.zombieSprite.x = this.zombie.position.x;
       this.zombieSprite.y = this.zombie.position.y;
     }
 
-    // 迷路外に出たら安全リセット（万一のスパイク対策）
+    // 迷路外に出たら復帰
     if (this.innerRect && !Phaser.Geom.Rectangle.Contains(this.innerRect, this.ball.x, this.ball.y)) {
       this.resetPlayerToStart();
       this.motionActive = false;
