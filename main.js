@@ -1,5 +1,5 @@
 import Phaser from 'phaser';
-import tamakoroPng from './tamakoro.png'; // 画像をバンドル方式で読み込む
+import tamakoroPng from './tamakoro.png'; // タマコロちゃん画像をバンドル
 
 class MainScene extends Phaser.Scene {
   constructor() {
@@ -7,11 +7,11 @@ class MainScene extends Phaser.Scene {
   }
 
   preload() {
-    this.load.image('ball', tamakoroPng); // importした画像をロード
+    this.load.image('ball', tamakoroPng);
   }
 
   create() {
-    // ===== 迷路定義（S=Start, G=Goal, #=Wall, .=Floor） =====
+    // ===== 迷路（S=Start, G=Goal, #=Wall, .=Floor） =====
     const map = [
       '#################',
       '#S..#.....#....G#',
@@ -28,7 +28,7 @@ class MainScene extends Phaser.Scene {
     const rows = map.length;
     const cols = map[0].length;
 
-    // 画面に収まるようにスケール調整
+    // 画面に収まるようにスケール（※レスポンシブ最適化は②で本格対応）
     const margin = 16;
     const tileSize = Math.max(
       18,
@@ -79,19 +79,22 @@ class MainScene extends Phaser.Scene {
       }
     };
 
-    // ===== 壁・スタート・ゴール生成 =====
+    // ===== 壁・S/G 生成 =====
     this.walls = this.physics.add.staticGroup();
     let startPos = { x: this.scale.width / 2, y: this.scale.height / 2 };
     let goalPos = null;
 
+    const cellToWorld = (cx, cy) => ({
+      x: offsetX + cx * tileSize + tileSize / 2,
+      y: offsetY + cy * tileSize + tileSize / 2,
+    });
+
     map.forEach((row, y) => {
       [...row].forEach((cell, x) => {
-        const cx = offsetX + x * tileSize + tileSize / 2;
-        const cy = offsetY + y * tileSize + tileSize / 2;
-
+        const { x: cx, y: cy } = cellToWorld(x, y);
         if (cell === '#') {
           const wall = this.add.rectangle(cx, cy, tileSize, tileSize, 0x555555);
-          this.physics.add.existing(wall, true);
+          this.physics.add.existing(wall, true); // static = true
           this.walls.add(wall);
         } else if (cell === 'S') {
           startPos = { x: cx, y: cy };
@@ -101,58 +104,66 @@ class MainScene extends Phaser.Scene {
       });
     });
 
-    // ===== プレイヤー（タマコロちゃん） =====
+    // ===== プレイヤー：タマコロちゃん（すり抜け防止チューニング） =====
     const ballR = Math.floor(tileSize * 0.45);
     const ballD = ballR * 2;
     this.ball = this.physics.add.image(startPos.x, startPos.y, 'ball');
     this.ball.setDisplaySize(ballD, ballD);
     this.ball.body.setCircle(ballR);
-    this.ball.body.setBounce(0.6);
     this.ball.body.setCollideWorldBounds(true);
+
+    // ★ すり抜け防止のためのチューニング
+    this.physics.world.setFPS(120);          // 物理更新頻度UP（安定性UP）
+    this.ball.body.setMaxVelocity(230, 230); // 最大速度を制限
+    this.ball.body.setBounce(0.3);           // 跳ねすぎ防止で少し低めに
+    this.ball.body.setDamping(true);         // 速度減衰を有効
+    this.ball.body.setDrag(180, 180);        // ドラッグで減速（数値はお好みで）
 
     // ===== ゴール =====
     const goalR = Math.max(10, Math.floor(tileSize * 0.35));
     this.goal = this.add.circle(goalPos?.x || startPos.x, goalPos?.y || startPos.y, goalR, 0x00ff66);
     this.physics.add.existing(this.goal, true);
 
-    // ===== ゾンビ（赤丸） =====
+    // ===== ゾンビ（赤丸のまま）※③で画像に差し替え =====
     const zombieR = Math.floor(tileSize * 0.42);
-    const zSpawn = goalPos || { x: offsetX + (cols - 2) * tileSize, y: offsetY + (rows - 2) * tileSize };
+    const zSpawn = goalPos || cellToWorld(cols - 2, rows - 2);
     this.zombie = this.add.circle(zSpawn.x, zSpawn.y, zombieR, 0xff4d4d);
     this.physics.add.existing(this.zombie);
     this.zombie.body.setCircle(zombieR);
     this.zombie.body.setCollideWorldBounds(true);
 
-    // 衝突判定
+    // ===== 衝突・判定 =====
     this.physics.add.collider(this.ball, this.walls);
     this.physics.add.collider(this.zombie, this.walls);
 
-    // ゴール判定
     this.physics.add.overlap(this.ball, this.goal, () => {
-      this.add.text(this.scale.width / 2, this.scale.height / 2, 'GOAL! 🎉', {
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(this.scale.width * 0.08) + 'px',
-        color: '#00ff66',
-        stroke: '#003300',
-        strokeThickness: 2,
-      }).setOrigin(0.5);
+      this.add
+        .text(this.scale.width / 2, this.scale.height / 2, 'GOAL! 🎉', {
+          fontFamily: 'system-ui, -apple-system, sans-serif',
+          fontSize: Math.floor(this.scale.width * 0.08) + 'px',
+          color: '#00ff66',
+          stroke: '#003300',
+          strokeThickness: 2,
+        })
+        .setOrigin(0.5);
       this.time.delayedCall(1100, () => this.scene.restart());
     });
 
-    // ゾンビとの接触でゲームオーバー
     this.physics.add.overlap(this.ball, this.zombie, () => {
-      this.add.text(this.scale.width / 2, this.scale.height / 2, 'GAME OVER 💀', {
-        fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(this.scale.width * 0.08) + 'px',
-        color: '#ff4d4d',
-        stroke: '#330000',
-        strokeThickness: 2,
-      }).setOrigin(0.5);
+      this.add
+        .text(this.scale.width / 2, this.scale.height / 2, 'GAME OVER 💀', {
+          fontFamily: 'system-ui, -apple-system, sans-serif',
+          fontSize: Math.floor(this.scale.width * 0.08) + 'px',
+          color: '#ff4d4d',
+          stroke: '#330000',
+          strokeThickness: 2,
+        })
+        .setOrigin(0.5);
       this.time.delayedCall(1100, () => this.scene.restart());
     });
 
-    // ===== ゾンビ追跡（簡易AI） =====
-    const ZOMBIE_SPEED = Math.max(60, Math.floor(tileSize * 3));
+    // ===== ゾンビの簡易追跡（速度は控えめ） =====
+    const ZOMBIE_SPEED = Math.max(50, Math.floor(tileSize * 2.4));
     this.time.addEvent({
       delay: 500,
       loop: true,
@@ -171,16 +182,27 @@ class MainScene extends Phaser.Scene {
 
   update() {
     if (!this.ball?.body) return;
-    this.ball.body.setVelocity(this.tilt.x * 200, this.tilt.y * 200);
+
+    // ★ 速度を直接ガンガン上げるのではなく、加速度でじわっと動かす
+    const ACCEL = 700; // 端末傾きの強度に対する加速度（お好みで調整）
+    this.ball.body.setAcceleration(this.tilt.x * ACCEL, this.tilt.y * ACCEL);
+    // 最大速度は setMaxVelocity で制限済み
   }
 }
 
 // ===== ゲーム起動 =====
-new Phaser.Game({
+const game = new Phaser.Game({
   type: Phaser.AUTO,
   width: window.innerWidth,
   height: window.innerHeight,
   backgroundColor: '#111',
-  physics: { default: 'arcade' },
+  physics: {
+    default: 'arcade',
+    arcade: {
+      // debug: true,        // 必要なら有効化して動きを確認
+      fps: 120,              // ワールド既定FPS（create内でも setFPS 済み）
+      gravity: { x: 0, y: 0 }
+    },
+  },
   scene: MainScene,
 });
