@@ -4,12 +4,10 @@ import tamakoroPng from './tamakoro.png';
 class MainScene extends Phaser.Scene {
   constructor() { super('main'); }
 
-  preload() {
-    this.load.image('ball', tamakoroPng);
-  }
+  preload() { this.load.image('ball', tamakoroPng); }
 
   create() {
-    // ===== 迷路 =====
+    // === 迷路定義 ===
     this.map = [
       '#################',
       '#S..#.....#....G#',
@@ -24,7 +22,7 @@ class MainScene extends Phaser.Scene {
       '#################',
     ];
 
-    // iOS センサー許可
+    // === iOSモーション許可 ===
     this.tilt = { x: 0, y: 0 };
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
@@ -47,41 +45,43 @@ class MainScene extends Phaser.Scene {
         btn.remove();
       } catch (e) {
         console.error(e);
-        alert('Motion permission failed. Try again over HTTPS.');
+        alert('Motion permission failed.');
       }
     };
 
-    this.buildLayout();
+    // === 初期描画は「50ms遅延」で安定した実サイズを取得してから ===
+    this.time.delayedCall(50, () => this.buildLayout());
 
-    // 画面回転/アドレスバー変化に追従
-    this.scale.on('resize', () => {
-      document.querySelectorAll('button').forEach(b => {
-        if (b.innerText.includes('Enable Motion')) b.remove();
-      });
-      this.scene.restart();
-    });
+    // 画面変化に追従（iOSアドレスバーの出入り/回転 等）
+    this.scale.on('resize', () => this.scene.restart());
+    window.visualViewport?.addEventListener('resize', () => this.scene.restart(), { passive:true });
+  }
+
+  // 現在の実サイズ（iOSは visualViewport 優先）
+  getViewSize() {
+    const vw = Math.floor(window.visualViewport?.width  ?? window.innerWidth  ?? this.scale.width  ?? 1);
+    const vh = Math.floor(window.visualViewport?.height ?? window.innerHeight ?? this.scale.height ?? 1);
+    return { vw: Math.max(1, vw), vh: Math.max(1, vh) };
   }
 
   buildLayout() {
     const rows = this.map.length;
     const cols = this.map[0].length;
 
-    // ★ iOSで安定する this.scale.width/height を使用
-    const viewW = Math.max(1, Math.floor(this.scale.width));
-    const viewH = Math.max(1, Math.floor(this.scale.height));
+    const { vw, vh } = this.getViewSize();
 
     const margin = 16;
     const tileSize = Math.max(
       18,
       Math.floor(Math.min(
-        (viewW - margin * 2) / cols,
-        (viewH - margin * 2) / rows
+        (vw - margin * 2) / cols,
+        (vh - margin * 2) / rows
       ))
     );
     const mapW = cols * tileSize;
     const mapH = rows * tileSize;
-    const offsetX = Math.floor(viewW / 2 - mapW / 2);
-    const offsetY = Math.floor(viewH / 2 - mapH / 2);
+    const offsetX = Math.floor(vw / 2 - mapW / 2);
+    const offsetY = Math.floor(vh / 2 - mapH / 2);
 
     const cellToWorld = (cx, cy) => ({
       x: offsetX + cx * tileSize + tileSize / 2,
@@ -93,7 +93,7 @@ class MainScene extends Phaser.Scene {
 
     // 壁
     this.walls = this.physics.add.staticGroup();
-    let startPos = { x: viewW/2, y: viewH/2 };
+    let startPos = { x: vw/2, y: vh/2 };
     let goalPos = null;
 
     this.map.forEach((row, y) => {
@@ -112,7 +112,7 @@ class MainScene extends Phaser.Scene {
       });
     });
 
-    // プレイヤー（タマコロ）
+    // プレイヤー
     const ballR = Math.floor(tileSize * 0.38);
     const ballD = ballR * 2;
     this.ball = this.physics.add.image(startPos.x, startPos.y, 'ball');
@@ -129,7 +129,7 @@ class MainScene extends Phaser.Scene {
     this.goal = this.add.circle(goalPos?.x || startPos.x, goalPos?.y || startPos.y, goalR, 0x00ff66);
     this.physics.add.existing(this.goal, true);
 
-    // ゾンビ（仮：赤丸）
+    // ゾンビ（仮）
     const zombieR = Math.floor(tileSize * 0.40);
     const zSpawn = goalPos || cellToWorld(cols - 2, rows - 2);
     this.zombie = this.add.circle(zSpawn.x, zSpawn.y, zombieR, 0xff4d4d);
@@ -142,24 +142,24 @@ class MainScene extends Phaser.Scene {
     this.physics.add.collider(this.zombie, this.walls);
 
     this.physics.add.overlap(this.ball, this.goal, () => {
-      this.add.text(viewW/2, viewH/2, 'GOAL! 🎉', {
+      this.add.text(vw/2, vh/2, 'GOAL! 🎉', {
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(viewW * 0.08) + 'px',
+        fontSize: Math.floor(vw * 0.08) + 'px',
         color: '#00ff66', stroke: '#003300', strokeThickness: 2,
       }).setOrigin(0.5);
       this.time.delayedCall(1100, () => this.scene.restart());
     });
 
     this.physics.add.overlap(this.ball, this.zombie, () => {
-      this.add.text(viewW/2, viewH/2, 'GAME OVER 💀', {
+      this.add.text(vw/2, vh/2, 'GAME OVER 💀', {
         fontFamily: 'system-ui, -apple-system, sans-serif',
-        fontSize: Math.floor(viewW * 0.08) + 'px',
+        fontSize: Math.floor(vw * 0.08) + 'px',
         color: '#ff4d4d', stroke: '#330000', strokeThickness: 2,
       }).setOrigin(0.5);
       this.time.delayedCall(1100, () => this.scene.restart());
     });
 
-    // ゾンビ追跡
+    // 追跡
     const ZOMBIE_SPEED = Math.max(50, Math.floor(tileSize * 2.2));
     this.time.addEvent({
       delay: 500, loop: true,
@@ -167,11 +167,8 @@ class MainScene extends Phaser.Scene {
         const dx = this.ball.x - this.zombie.x;
         const dy = this.ball.y - this.zombie.y;
         const dist = Math.hypot(dx, dy);
-        if (dist > 5) {
-          this.zombie.body.setVelocity((dx / dist) * ZOMBIE_SPEED, (dy / dist) * ZOMBIE_SPEED);
-        } else {
-          this.zombie.body.setVelocity(0, 0);
-        }
+        if (dist > 5) this.zombie.body.setVelocity((dx / dist) * ZOMBIE_SPEED, (dy / dist) * ZOMBIE_SPEED);
+        else this.zombie.body.setVelocity(0, 0);
       },
     });
 
@@ -184,7 +181,7 @@ class MainScene extends Phaser.Scene {
   }
 }
 
-// 起動：FIT + CENTER_BOTH（iOSで安定）
+// 起動：FIT + CENTER_BOTH
 const game = new Phaser.Game({
   type: Phaser.AUTO,
   backgroundColor: '#111',
@@ -196,16 +193,11 @@ const game = new Phaser.Game({
   },
   physics: {
     default: 'arcade',
-    arcade: {
-      fps: 180,
-      gravity: { x: 0, y: 0 },
-      // debug: true,
-    },
+    arcade: { fps: 180, gravity: { x: 0, y: 0 } }
   },
   scene: MainScene,
 });
 
-// ウィンドウサイズ変化に追従
-window.addEventListener('resize', () => {
-  game.scale.resize(window.innerWidth, window.innerHeight);
-});
+// 画面変化はゲーム側とvisualViewportの両方で拾う
+window.addEventListener('resize', () => game.scale.resize(window.innerWidth, window.innerHeight));
+window.visualViewport?.addEventListener('resize', () => game.scale.resize(window.visualViewport.width, window.visualViewport.height), { passive:true });
