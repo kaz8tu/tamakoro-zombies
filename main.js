@@ -6,32 +6,36 @@ class MainScene extends Phaser.Scene {
     super('main');
 
     // センサー/フィルタ
-    this.tilt = { x: 0, y: 0 };       // 生
-    this.smooth = { x: 0, y: 0 };     // ローパス後
-    this.alpha = 0.10;                // ローパス係数（小さいほどなめらか）
-    this.deadZone = 0.18;             // デッドゾーン（この絶対値以下は0扱い）
+    this.tilt   = { x: 0, y: 0 };   // 生
+    this.smooth = { x: 0, y: 0 };   // ローパス
+    this.alpha  = 0.14;             // 応答（少し速め）
+    this.deadZone = 0.08;           // 微小ノイズを殺す
 
-    // センサーの基準（キャリブレーションで求める）
+    // キャリブ用
     this.bias = { x: 0, y: 0 };
     this.calibrating = false;
-    this.calibSamples = [];           // {x,y} を溜める
-    this.motionActive = false;        // 力を加える許可
+    this.calibSamples = [];
+
+    // 動作制御
+    this.motionActive = false;      // 力を加えるフラグ
+    this.motionEnabledAt = 0;
 
     // 物理パラメータ（控えめ）
-    this.forceK = 0.00035;            // 力スケール
-    this.maxSpeed = 6.5;              // 最高速度
+    this.forceK   = 0.00042;
+    this.maxSpeed = 7.2;
 
     // 迷路情報
-    this.startPos = { x: 0, y: 0 };
-    this.innerRect = null;            // 迷路矩形
+    this.startPos  = { x: 0, y: 0 };
+    this.innerRect = null;
+
+    // デバッグHUD
+    this.debugText = null;
   }
 
-  preload() {
-    this.load.image('ball', tamakoroPng);
-  }
+  preload() { this.load.image('ball', tamakoroPng); }
 
   create() {
-    // 迷路（S=Start, G=Goal, #=Wall）
+    // 迷路
     this.map = [
       '#################',
       '#S..#.....#....G#',
@@ -46,7 +50,7 @@ class MainScene extends Phaser.Scene {
       '#################',
     ];
 
-    // --- ボタンUI ---
+    // ===== UI（許可 & 再キャリブ）=====
     const needIOSPermission =
       typeof DeviceMotionEvent !== 'undefined' &&
       typeof DeviceMotionEvent.requestPermission === 'function';
@@ -69,25 +73,31 @@ class MainScene extends Phaser.Scene {
         }
         this.setupSensors();
         this.resetPlayerToStart();
-        this.startCalibration(1000);       // ← 許可直後に1秒キャリブレーション
-        this.motionActive = false;         // キャリブ中は動かさない
-        setTimeout(() => { this.motionActive = true; }, 1100);
+        this.startCalibration(1000);          // 許可直後1秒キャリブ
+        this.motionActive = false;            // キャリブ中はオフ
+        setTimeout(() => { this.motionActive = true; }, 1200);
         permBtn.remove();
       } catch (e) { console.error(e); alert('Motion permission failed.'); }
     };
 
     calibBtn.onclick = () => {
-      // いつでも再キャリブレーション可能
-      this.startCalibration(800);
+      this.startCalibration(700);
       this.motionActive = false;
-      setTimeout(() => { this.motionActive = true; }, 900);
       this.resetPlayerToStart();
+      setTimeout(() => { this.motionActive = true; }, 900);
     };
 
-    // 迷路構築
+    // 迷路・物理構築
     this.build();
 
-    // リサイズは軽くリスタート（デバウンス）
+    // デバッグHUD
+    this.debugText = this.add.text(8, 8, 'debug', {
+      fontFamily: 'system-ui,-apple-system,sans-serif',
+      fontSize: '12px',
+      color: '#0f0'
+    }).setDepth(1000).setScrollFactor(0);
+
+    // リサイズは軽くリスタート
     let t=null;
     const onResize=()=>{ clearTimeout(t); t=setTimeout(()=>this.scene.restart(),150); };
     window.addEventListener('resize', onResize, {passive:true});
@@ -95,54 +105,46 @@ class MainScene extends Phaser.Scene {
   }
 
   setupSensors() {
-    // devicemotion を主に使う（重力込み）
+    // devicemotion 優先（重力込み）
     window.addEventListener('devicemotion', (e) => {
       const g = e.accelerationIncludingGravity; if (!g) return;
       const portrait = window.matchMedia('(orientation: portrait)').matches;
       const ax = portrait ? g.x : g.y;
       const ay = portrait ? g.y : -g.x;
 
-      // キャリブ中はサンプル収集
-      if (this.calibrating) {
-        this.calibSamples.push({ x: ax, y: ay });
-        return;
-      }
+      if (this.calibrating) { this.calibSamples.push({x:ax,y:ay}); return; }
 
-      // バイアス（基準）を引いて“傾き成分”だけにする
       this.tilt.x = ax - this.bias.x;
       this.tilt.y = ay - this.bias.y;
     }, { passive:true });
 
-    // 予備（端末によってはdevicemotionが粗いとき用）
-    window.addEventListener('deviceorientation', (e)=>{
-      if (this.calibrating) return; // キャリブ中は混ぜない
+    // フォールバック（弱めに寄与）
+    window.addEventListener('deviceorientation', (e) => {
+      if (this.calibrating) return;
       const portrait = window.matchMedia('(orientation: portrait)').matches;
-      const gamma=(e.gamma||0)*0.12, beta=(e.beta||0)*0.12;
-      // orientation は弱めに混ぜる
+      const gamma=(e.gamma||0)*0.10, beta=(e.beta||0)*0.10;
       const ox = portrait ? gamma : beta;
       const oy = portrait ? beta  : -gamma;
-      // バイアス適用
-      this.tilt.x = ox - this.bias.x * 0.0;
-      this.tilt.y = oy - this.bias.y * 0.0;
+      // 加算寄与（メインはdevicemotion）
+      this.tilt.x += ox * 0.15;
+      this.tilt.y += oy * 0.15;
     }, { passive:true });
   }
 
-  startCalibration(durationMs) {
-    // 現在姿勢の平均を取って「0」とみなす
+  startCalibration(ms) {
     this.calibrating = true;
     this.calibSamples = [];
     setTimeout(() => {
       if (this.calibSamples.length) {
-        const sx = this.calibSamples.reduce((s,v)=>s+v.x,0) / this.calibSamples.length;
-        const sy = this.calibSamples.reduce((s,v)=>s+v.y,0) / this.calibSamples.length;
+        const sx = this.calibSamples.reduce((s,v)=>s+v.x,0)/this.calibSamples.length;
+        const sy = this.calibSamples.reduce((s,v)=>s+v.y,0)/this.calibSamples.length;
         this.bias.x = sx;
         this.bias.y = sy;
       }
       this.calibrating = false;
-      // フィルタもリセット
       this.smooth.x = 0;
       this.smooth.y = 0;
-    }, durationMs);
+    }, ms);
   }
 
   build() {
@@ -159,22 +161,21 @@ class MainScene extends Phaser.Scene {
     const offsetY = Math.floor(viewH/2 - mapH/2);
     const toWorld = (cx,cy)=>({ x: offsetX + cx*tile + tile/2, y: offsetY + cy*tile + tile/2 });
 
-    // 迷路矩形を記録（境界外検知用）
     this.innerRect = new Phaser.Geom.Rectangle(offsetX, offsetY, mapW, mapH);
 
-    // Matter 安定化
+    // Matter強化
     this.matter.world.engine.positionIterations = 10;
     this.matter.world.engine.velocityIterations = 10;
     this.matter.world.engine.world.gravity.x = 0;
     this.matter.world.engine.world.gravity.y = 0;
 
-    // 迷路矩形＝世界境界（厚み＝タイル幅）
+    // 迷路矩形＝世界境界（厚み=タイル幅）
     this.matter.world.setBounds(offsetX, offsetY, mapW, mapH, tile, true, true, true, true);
 
     // 背景
     this.add.rectangle(offsetX + mapW/2, offsetY + mapH/2, mapW, mapH, 0x111111);
 
-    // 壁（静的）
+    // 壁
     this.map.forEach((row,y)=>{ [...row].forEach((c,x)=>{
       const {x:wx,y:wy}=toWorld(x,y);
       if(c==='#'){
@@ -185,7 +186,7 @@ class MainScene extends Phaser.Scene {
       }
     });});
 
-    // スタート/ゴール
+    // S/G
     let start=toWorld(1,1), goal=toWorld(cols-2,1);
     this.map.forEach((row,y)=>{ [...row].forEach((c,x)=>{
       if(c==='S') start=toWorld(x,y);
@@ -197,23 +198,23 @@ class MainScene extends Phaser.Scene {
     this.goalBody = this.matter.add.circle(goal.x, goal.y, goalR, {isStatic:true, label:'goal'});
     this.add.circle(goal.x, goal.y, goalR, 0x00ff66);
 
-    // プレイヤー（空気抵抗を強め、回転慣性を無効化）
+    // プレイヤー
     const r = Math.floor(tile*0.38);
     this.ball = this.matter.add.image(start.x, start.y, 'ball', null, {
       shape:{ type:'circle', radius:r },
       restitution: 0.06,
-      frictionAir: 0.14,   // ← 強めにして暴走抑制
+      frictionAir: 0.14,
       friction: 0.002,
       label:'ball'
     });
     this.ball.setDisplaySize(r*2, r*2);
     Phaser.Physics.Matter.Matter.Body.setInertia(this.ball.body, Infinity);
 
-    // ゾンビ（安全な内側セル）
+    // ゾンビ（安全スポーン）
     const zR = Math.floor(tile*0.40);
     const zSpawn = toWorld(cols - 2, rows - 2);
     this.zombie = this.matter.add.circle(zSpawn.x, zSpawn.y, zR, {
-      restitution:0.02, frictionAir:0.08, label:'zombie'
+      restitution: 0.02, frictionAir: 0.08, label: 'zombie'
     });
     this.zombieSprite = this.add.circle(zSpawn.x, zSpawn.y, zR, 0xff4d4d);
 
@@ -227,6 +228,21 @@ class MainScene extends Phaser.Scene {
         if(hitZombie){ this.centerText('GAME OVER 💀','#f55','#300'); this.time.delayedCall(900,()=>this.scene.restart()); return; }
       }
     });
+
+    // ゾンビの「確実な追跡」保険：0.2秒毎に目的地に向けて微力を加える
+    this.time.addEvent({
+      delay: 200,
+      loop: true,
+      callback: () => {
+        if (!this.zombie || !this.ball) return;
+        const Body = Phaser.Physics.Matter.Matter.Body;
+        const dx = this.ball.body.position.x - this.zombie.position.x;
+        const dy = this.ball.body.position.y - this.zombie.position.y;
+        const d = Math.hypot(dx, dy) || 1;
+        const force = 0.0004; // 小さめ
+        Body.applyForce(this.zombie, this.zombie.position, { x: (dx/d)*force, y: (dy/d)*force });
+      }
+    });
   }
 
   resetPlayerToStart() {
@@ -234,8 +250,7 @@ class MainScene extends Phaser.Scene {
     const Body = Phaser.Physics.Matter.Matter.Body;
     Body.setPosition(this.ball.body, { x: this.startPos.x, y: this.startPos.y });
     Body.setVelocity(this.ball.body, { x: 0, y: 0 });
-    this.smooth.x = 0;
-    this.smooth.y = 0;
+    this.smooth.x = 0; this.smooth.y = 0;
   }
 
   centerText(msg,color,stroke){
@@ -245,49 +260,56 @@ class MainScene extends Phaser.Scene {
   }
 
   update() {
-    if(!this.ball?.body || !this.motionActive) return;
+    if (!this.ball?.body) return;
 
-    // ローパス
+    // センサー → ローパス
     this.smooth.x += this.alpha * (this.tilt.x - this.smooth.x);
     this.smooth.y += this.alpha * (this.tilt.y - this.smooth.y);
 
-    // デッドゾーン（微小な揺れをゼロに）
+    // デッドゾーン
     const ax = (Math.abs(this.smooth.x) < this.deadZone) ? 0 : this.smooth.x;
     const ay = (Math.abs(this.smooth.y) < this.deadZone) ? 0 : this.smooth.y;
 
+    // デバッグHUD
+    const v = this.ball.body.velocity;
+    this.debugText?.setText(
+      `tilt raw=(${this.tilt.x.toFixed(2)}, ${this.tilt.y.toFixed(2)})  ` +
+      `smooth=(${this.smooth.x.toFixed(2)}, ${this.smooth.y.toFixed(2)})  ` +
+      `apply=(${ax.toFixed(2)}, ${ay.toFixed(2)})  ` +
+      `speed=${Math.hypot(v.x,v.y).toFixed(2)}  ` +
+      `active=${this.motionActive}  calib=${this.calibrating}`
+    );
+
     const Body = Phaser.Physics.Matter.Matter.Body;
 
-    // 力を加える（基準0からの差だけ）
-    Body.applyForce(this.ball.body, this.ball.body.position, {
-      x: ax * this.forceK,
-      y: ay * this.forceK
-    });
+    // 力を加える（motionActiveのときだけ）
+    if (this.motionActive) {
+      Body.applyForce(this.ball.body, this.ball.body.position, { x: ax * this.forceK, y: ay * this.forceK });
+    }
 
     // 最高速度制限
-    const v=this.ball.body.velocity, sp=Math.hypot(v.x,v.y);
-    if(sp>this.maxSpeed) Body.setVelocity(this.ball.body,{x:v.x*(this.maxSpeed/sp), y:y=v.y*(this.maxSpeed/sp)});
+    const sp = Math.hypot(v.x, v.y);
+    if (sp > this.maxSpeed) {
+      const s = this.maxSpeed / sp;
+      Body.setVelocity(this.ball.body, { x: v.x * s, y: v.y * s });
+    }
 
-    // 迷路外検知：外へ出たら安全に戻す（まれなスパイク対策）
+    // ゾンビの描画同期
+    if (this.zombie && this.zombieSprite) {
+      this.zombieSprite.x = this.zombie.position.x;
+      this.zombieSprite.y = this.zombie.position.y;
+    }
+
+    // 迷路外に出たら安全リセット（万一のスパイク対策）
     if (this.innerRect && !Phaser.Geom.Rectangle.Contains(this.innerRect, this.ball.x, this.ball.y)) {
       this.resetPlayerToStart();
       this.motionActive = false;
-      // ちょい待ってから再開（連続スパイクを受けない）
-      setTimeout(()=>{ this.motionActive = true; }, 400);
-    }
-
-    // ゾンビ追従 & 表示同期
-    if(this.zombie && this.zombieSprite){
-      const dx=this.ball.body.position.x - this.zombie.position.x;
-      const dy=this.ball.body.position.y - this.zombie.position.y;
-      const d=Math.hypot(dx,dy)||1, speedZ=5.6;
-      Phaser.Physics.Matter.Matter.Body.setVelocity(this.zombie,{x:(dx/d)*speedZ,y:(dy/d)*speedZ});
-      this.zombieSprite.x = this.zombie.position.x;
-      this.zombieSprite.y = this.zombie.position.y;
+      setTimeout(() => { this.motionActive = true; }, 400);
     }
   }
 }
 
-// 起動（Matter）
+// 起動
 new Phaser.Game({
   type: Phaser.AUTO,
   backgroundColor: '#111',
